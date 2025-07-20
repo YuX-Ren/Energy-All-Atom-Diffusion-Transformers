@@ -1,6 +1,6 @@
 _target_: src.models.ldm_module.LatentDiffusionLitModule
 
-autoencoder_ckpt: ""  # path to VAE checkpoint
+autoencoder_ckpt: "ADiT_ckpt/vae.ckpt"  # path to VAE checkpoint
 
 denoiser:
   _target_: src.models.denoisers.dit.DiT
