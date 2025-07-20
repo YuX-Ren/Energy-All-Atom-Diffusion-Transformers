@@ -392,11 +392,16 @@ class DiT(nn.Module):
             torch.Tensor: Velocity field (B, N, d_in)
             torch.Tensor: Logits for each dataset class (B, N, num_datasets)
         """
-        x.requires_grad_(True)
-        energy_scores = self.forward(x, t, dataset_idx, spacegroup, mask)
-        velocity = -torch.autograd.grad(
-            energy_scores.sum(), x, create_graph=True, retain_graph=True
-        )[0]
+        with torch.enable_grad():   
+            x.requires_grad_(True)
+        
+            # Get energy scores
+            energy_scores = self.forward(x, t, dataset_idx, spacegroup, mask)
+            
+            # Compute velocity as negative gradient of energy
+            velocity = -torch.autograd.grad(
+                energy_scores.sum(dim=1), x, grad_outputs=torch.ones(energy_scores.shape[0], device=energy_scores.device), create_graph=True, retain_graph=True,
+            )[0]
         return velocity, energy_scores
 
     def forward_with_cfg(self, x, t, dataset_idx, spacegroup, mask, cfg_scale):
@@ -407,13 +412,19 @@ class DiT(nn.Module):
         samples and the second half are the unconditional samples.
         """
         # compute energy score over the dataset_idx
-        x.requires_grad_(True)
-        single_energy_score = self.forward(x, t, dataset_idx, spacegroup, mask)[..., dataset_idx]
-        single_energy_score = single_energy_score * mask[..., None]
-        
-        # compute velocity as gradient of energy
-        velocity = -torch.autograd.grad(
-            single_energy_score, x, create_graph=True, retain_graph=True
-        )[0]
-        
+        with torch.enable_grad():   
+            x.requires_grad_(True)
+            single_energy_score = self.forward(x, t, dataset_idx, spacegroup, mask)
+            # energy scores shape (B, num_datasets) dataset_idx is (B,)
+            # single_energy_score is (B,1)
+            single_energy_score = single_energy_score.gather(1, dataset_idx.unsqueeze(1)).squeeze(1)
+            # compute velocity as gradient of energy
+            try:
+                velocity = -torch.autograd.grad(
+                    single_energy_score, x, grad_outputs=torch.ones(single_energy_score.shape[0], device=single_energy_score.device), create_graph=False, retain_graph=False,
+                )[0]
+            except Exception as e:
+                raise ValueError(single_energy_score.shape)
+        del single_energy_score
+        velocity = velocity.detach()
         return velocity

@@ -233,7 +233,7 @@ class FlowMatchingInterpolant:
                 tokens_traj (list): List of generated samples at each timestep.
                 clean_traj (list): List of denoised samples at each timestep.
         """
-        assert torch.all(dataset_idx > 0), "Dataset 0 -> null class"
+        # assert torch.all(dataset_idx > 0), "Dataset 0 -> null class"
 
         # Set-up initial prior samples
         if x_0 is None:

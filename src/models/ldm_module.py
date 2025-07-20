@@ -484,7 +484,7 @@ class LatentDiffusionLitModule(LightningModule):
         velocity, logits, noisy_dense_encoded_batch = self.forward(batch)
 
         # calculate loss
-        loss_dict = self.criterion(noisy_dense_encoded_batch, velocity, logits)
+        loss_dict = self.criterion(noisy_dense_encoded_batch, velocity, logits, batch.dataset_idx)
 
         # update and log per-step val metrics
         for k, v in loss_dict.items():
@@ -598,7 +598,7 @@ class LatentDiffusionLitModule(LightningModule):
         # create dataset_idx tensor
         # NOTE 0 -> null class within DiT, while 0 -> MP20 elsewhere, so increment by 1
         dataset_idx = torch.full(
-            (batch_size,), dataset_idx + 1, dtype=torch.int64, device=self.device
+            (batch_size,), dataset_idx, dtype=torch.int64, device=self.device
         )
 
         # create spacegroup tensor
