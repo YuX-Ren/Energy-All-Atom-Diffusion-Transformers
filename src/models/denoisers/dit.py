@@ -146,6 +146,49 @@ def modulate(x, shift, scale):
     # TODO this is global modulation; explore per-token modulation
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+# rewrite the multihead attention instead of import from torch.nn
+class MultiheadAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads, dropout=0, bias=True, batch_first=True):
+        super().__init__()
+        self.num_heads = num_heads
+        self.q = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.k = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.v = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.out = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.dropout = dropout
+
+    def init_weights(self):
+        nn.init.xavier_uniform_(self.q.weight)
+        nn.init.xavier_uniform_(self.k.weight)
+        nn.init.xavier_uniform_(self.v.weight)
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.constant_(self.q.bias, 0)
+        nn.init.constant_(self.k.bias, 0)
+        nn.init.constant_(self.v.bias, 0)
+        nn.init.constant_(self.out.bias, 0)
+
+    def forward(self, query, key, value, key_padding_mask=None, need_weights=False):
+        # add key padding mask
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            key_padding_mask = key_padding_mask.repeat(1, self.num_heads, 1, 1)
+            key_padding_mask = key_padding_mask.to(query.device)
+            key_padding_mask = key_padding_mask.bool()
+            
+        q = self.q(query)
+        k = self.k(key)
+        v = self.v(value)
+        q = q.view(q.size(0), q.size(1), self.num_heads, -1).transpose(1, 2)
+        k = k.view(k.size(0), k.size(1), self.num_heads, -1).transpose(1, 2)
+        v = v.view(v.size(0), v.size(1), self.num_heads, -1).transpose(1, 2)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = F.dropout(attn_weights, p=self.dropout)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(query.size(0), -1, query.size(-1))
+        attn_output = self.out(attn_output)
+        return attn_output
+
 
 class DiTBlock(nn.Module):
     """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning."""
@@ -153,9 +196,7 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_dim, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.attn = nn.MultiheadAttention(
-            hidden_dim, num_heads=num_heads, dropout=0, bias=True, batch_first=True
-        )
+        self.attn = MultiheadAttention(hidden_dim, num_heads=num_heads, dropout=0, bias=True, batch_first=True)
         self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -181,12 +222,13 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    """The final layer of DiT."""
+    """The final layer of DiT for energy-based velocity prediction in flow matching."""
 
-    def __init__(self, hidden_dim, out_dim):
+    def __init__(self, hidden_dim, out_dim, num_classes):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_dim, out_dim, bias=True)
+        # Energy head for each class - velocity will be computed as gradient of energy
+        self.energy_head = nn.Linear(hidden_dim, num_classes, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_dim, 2 * hidden_dim, bias=True)
         )
@@ -194,12 +236,13 @@ class FinalLayer(nn.Module):
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        return x
+        # Output energy scores - velocity will be computed as gradient
+        energy_scores = self.energy_head(x)
+        return energy_scores
 
 
 class DiT(nn.Module):
-    """Diffusion model with a Transformer backbone.
+    """Joint energy-based flow matching model with a Transformer backbone.
 
     Args:
         d_x (int): Input dimension
@@ -227,16 +270,17 @@ class DiT(nn.Module):
         self.d_x = d_x
         self.d_model = d_model
         self.nhead = nhead
+        self.num_datasets = num_datasets
 
-        self.x_embedder = nn.Linear(2 * d_x, d_model, bias=True)
-        self.t_embedder = TimestepEmbedder(d_model)
-        self.dataset_embedder = LabelEmbedder(num_datasets, d_model, class_dropout_prob)
+        self.x_embedder = nn.Linear(d_x, d_model, bias=True)
+        # self.t_embedder = TimestepEmbedder(d_model)
+        # self.dataset_embedder = LabelEmbedder(num_datasets, d_model, class_dropout_prob)
         self.spacegroup_embedder = LabelEmbedder(num_spacegroups, d_model, class_dropout_prob)
 
         self.blocks = nn.ModuleList(
             [DiTBlock(d_model, nhead, mlp_ratio=mlp_ratio) for _ in range(num_layers)]
         )
-        self.final_layer = FinalLayer(d_model, d_x)
+        self.final_layer = FinalLayer(d_model, d_x, num_datasets)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -250,12 +294,12 @@ class DiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize label embedding table:
-        nn.init.normal_(self.dataset_embedder.embedding_table.weight, std=0.02)
+        # nn.init.normal_(self.dataset_embedder.embedding_table.weight, std=0.02)
         nn.init.normal_(self.spacegroup_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        # nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        # nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
@@ -265,11 +309,12 @@ class DiT(nn.Module):
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        # Initialize energy head with small weights
+        nn.init.normal_(self.final_layer.energy_head.weight, std=0.02)
+        nn.init.constant_(self.final_layer.energy_head.bias, 0)
 
     def forward(self, x, t, dataset_idx, spacegroup, mask, x_sc=None):
-        """Forward pass of DiT.
+        """Forward pass of joint energy-based DiT.
 
         Args:
             x (torch.Tensor): Input data tensor (B, N, d_in)
@@ -278,43 +323,97 @@ class DiT(nn.Module):
             spacegroup (torch.Tensor): Spacegroup index for each sample (B,)
             mask (torch.Tensor): True if valid token, False if padding (B, N)
             x_sc (torch.Tensor): Self-conditioning x (B, N, d_in)
+            
+        Returns:
+            torch.Tensor: Energy scores for each dataset class (B, N, num_datasets)
         """
         # Positonal embedding
         token_index = torch.cumsum(mask, dim=-1, dtype=torch.int64) - 1
         pos_emb = get_pos_embedding(token_index, self.d_model)
 
-        # Self-conditioning and input embeddings: (B, N, d)
-        if x_sc is None:
-            x_sc = torch.zeros_like(x)
-        x = self.x_embedder(torch.cat([x, x_sc], dim=-1)) + pos_emb
+        # Input embeddings: (B, N, d) - no self-conditioning
+        x = self.x_embedder(x) + pos_emb
 
         # Conditioning embeddings
-        t = self.t_embedder(t.squeeze(1))  # (B, d)
-        d = self.dataset_embedder(dataset_idx, self.training)  # (B, d)
+        # desiable timestep embedding
+        # t = self.t_embedder(t.squeeze(1))  # (B, d)
+        # d = self.dataset_embedder(dataset_idx, self.training)  # (B, d)
         s = self.spacegroup_embedder(spacegroup, self.training)  # (B, d)
-        c = t + d + s  # (B, 1, d)
+        # c = t + d + s  # (B, 1, d)
+        c = s 
 
         # Transformer blocks
         for block in self.blocks:
             x = block(x, c, ~mask)  # (B, N, d)
 
-        # Prediction layer
-        x = self.final_layer(x, c)  # (B, N, d_out)
-        x = x * mask[..., None]
-        return x
+        # Prediction layer - outputs energy scores
+        energy_scores = self.final_layer(x, c)  # (B, N, num_datasets)
+        energy_scores = energy_scores * mask[..., None]
+        energy_scores = energy_scores.mean(dim=1)
+        return energy_scores
 
-    def forward_with_cfg(self, x, t, dataset_idx, spacegroup, mask, cfg_scale, x_sc=None):
+    def get_velocity(self, x, t, dataset_idx, spacegroup, mask):
+        """Get velocity as gradient of energy with respect to input x.
+        
+        Args:
+            x (torch.Tensor): Input data tensor (B, N, d_in)
+            t (torch.Tensor): Time step for each sample (B,)
+            dataset_idx (torch.Tensor): Dataset index for each sample (B,)
+            spacegroup (torch.Tensor): Spacegroup index for each sample (B,)
+            mask (torch.Tensor): True if valid token, False if padding (B, N)
+            
+        Returns:
+            torch.Tensor: Velocity field (B, N, d_in)
+        """
+        x.requires_grad_(True)
+        
+        # Get energy scores
+        energy_scores = self.forward(x, t, dataset_idx, spacegroup, mask)
+        
+        # Compute velocity as negative gradient of energy
+        # For flow matching, we want velocity to point towards lower energy
+        velocity = -torch.autograd.grad(
+            energy_scores.sum(), x, create_graph=True, retain_graph=True
+        )[0]
+        
+        return velocity
+
+    def get_velocity_and_logits(self, x, t, dataset_idx, spacegroup, mask):
+        """Get velocity as gradient of energy with respect to input x and logits for each dataset class.
+        
+        Args:
+            x (torch.Tensor): Input data tensor (B, N, d_in)
+            t (torch.Tensor): Time step for each sample (B,)
+            dataset_idx (torch.Tensor): Dataset index for each sample (B,)
+            spacegroup (torch.Tensor): Spacegroup index for each sample (B,)
+            mask (torch.Tensor): True if valid token, False if padding (B, N)
+            
+        Returns:
+            torch.Tensor: Velocity field (B, N, d_in)
+            torch.Tensor: Logits for each dataset class (B, N, num_datasets)
+        """
+        x.requires_grad_(True)
+        energy_scores = self.forward(x, t, dataset_idx, spacegroup, mask)
+        velocity = -torch.autograd.grad(
+            energy_scores.sum(), x, create_graph=True, retain_graph=True
+        )[0]
+        return velocity, energy_scores
+
+    def forward_with_cfg(self, x, t, dataset_idx, spacegroup, mask, cfg_scale):
         """Forward pass of DiT, but also batches the unconditional forward pass for classifier-free
         guidance.
 
         Assumes batch x's and class labels are ordered such that the first half are the conditional
         samples and the second half are the unconditional samples.
         """
-        half_x = x[: len(x) // 2]
-        combined_x = torch.cat([half_x, half_x], dim=0)
-        model_out = self.forward(combined_x, t, dataset_idx, spacegroup, mask, x_sc)
-
-        cond_eps, uncond_eps = torch.split(model_out, len(model_out) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return eps
+        # compute energy score over the dataset_idx
+        x.requires_grad_(True)
+        single_energy_score = self.forward(x, t, dataset_idx, spacegroup, mask)[..., dataset_idx]
+        single_energy_score = single_energy_score * mask[..., None]
+        
+        # compute velocity as gradient of energy
+        velocity = -torch.autograd.grad(
+            single_energy_score, x, create_graph=True, retain_graph=True
+        )[0]
+        
+        return velocity

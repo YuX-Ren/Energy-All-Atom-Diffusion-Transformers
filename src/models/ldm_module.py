@@ -131,6 +131,7 @@ class LatentDiffusionLitModule(LightningModule):
         self.train_metrics = ModuleDict(
             {
                 "loss": MeanMetric(),
+                "logits_loss": MeanMetric(),
                 "x_loss": MeanMetric(),
                 "x_loss t=[0,25)": MeanMetric(),
                 "x_loss t=[25,50)": MeanMetric(),
@@ -145,6 +146,7 @@ class LatentDiffusionLitModule(LightningModule):
                 "mp20": ModuleDict(
                     {
                         "loss": MeanMetric(),
+                        "logits_loss": MeanMetric(),
                         "x_loss": MeanMetric(),
                         "x_loss t=[0,25)": MeanMetric(),
                         "x_loss t=[25,50)": MeanMetric(),
@@ -162,6 +164,7 @@ class LatentDiffusionLitModule(LightningModule):
                 "qm9": ModuleDict(
                     {
                         "loss": MeanMetric(),
+                        "logits_loss": MeanMetric(),
                         "x_loss": MeanMetric(),
                         "x_loss t=[0,25)": MeanMetric(),
                         "x_loss t=[25,50)": MeanMetric(),
@@ -187,6 +190,7 @@ class LatentDiffusionLitModule(LightningModule):
                 "qmof150": ModuleDict(
                     {
                         "loss": MeanMetric(),
+                        "logits_loss": MeanMetric(),
                         "x_loss": MeanMetric(),
                         "x_loss t=[0,25)": MeanMetric(),
                         "x_loss t=[25,50)": MeanMetric(),
@@ -274,58 +278,50 @@ class LatentDiffusionLitModule(LightningModule):
         self.interpolant.device = dense_encoded_batch["x_1"].device
         noisy_dense_encoded_batch = self.interpolant.corrupt_batch(dense_encoded_batch)
 
-        # Prepare conditioning inputs to forward pass
-        dataset_idx = batch.dataset_idx + 1  # 0 -> null class
-        # if not self.hparams.conditioning.dataset_idx:
-        #     dataset_idx = torch.zeros_like(dataset_idx)
         spacegroup = batch.spacegroup
         if not self.hparams.conditioning.spacegroup:
             spacegroup = torch.zeros_like(batch.spacegroup)
 
-        # Use self-conditioning for ~half training batches
-        if (
-            self.interpolant.self_condition
-            and random.random() < self.interpolant.self_condition_prob
-        ):
-            with torch.no_grad():
-                x_sc = self.denoiser(
-                    x=noisy_dense_encoded_batch["x_t"],
-                    t=noisy_dense_encoded_batch["t"],
-                    dataset_idx=dataset_idx,
-                    spacegroup=spacegroup,
-                    mask=mask,
-                    x_sc=None,
-                )
-        else:
-            x_sc = None
-
-        # Run denoiser model
-        pred_x = self.denoiser(
+        # Run denoiser model to get velocity and energy scores
+        velocity, energy_scores = self.denoiser.get_velocity_and_logits(
             x=noisy_dense_encoded_batch["x_t"],
             t=noisy_dense_encoded_batch["t"],
-            dataset_idx=dataset_idx,
+            dataset_idx=batch.dataset_idx,
             spacegroup=spacegroup,
             mask=mask,
-            x_sc=x_sc,
         )
 
-        return pred_x, noisy_dense_encoded_batch
+        logits = torch.softmax(energy_scores, dim=-1)
+        return velocity, logits, noisy_dense_encoded_batch
 
     def criterion(
         self,
         noisy_dense_encoded_batch: Dict[str, torch.Tensor],
-        pred_x: torch.Tensor,
+        velocity: torch.Tensor,
+        logits: torch.Tensor,
+        dataset_idx: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        # Compute MSE loss w/ masking for padded tokens
-        gt_x_1 = noisy_dense_encoded_batch["x_1"]
-        norm_scale = 1 - torch.min(noisy_dense_encoded_batch["t"].unsqueeze(-1), torch.tensor(0.9))
-        x_error = (gt_x_1 - pred_x) / norm_scale
+        # Compute velocity prediction loss
+        # The model predicts energy scores, and we compute velocity as gradient of energy
+        # For flow matching, we want to predict the velocity field v = (x_1 - x_t) / (1 - t)
+        
+        x_t = noisy_dense_encoded_batch["x_t"]
+        x_1 = noisy_dense_encoded_batch["x_1"]
+        t = noisy_dense_encoded_batch["t"]
+
+        # Compute target velocity
+        target_velocity = (x_1 - x_t) / (1 - t.unsqueeze(-1))
+        
+        velocity_error = target_velocity - velocity
         loss_mask = (
             noisy_dense_encoded_batch["token_mask"] * noisy_dense_encoded_batch["diffuse_mask"]
         )
-        loss_denom = torch.sum(loss_mask, dim=-1) * pred_x.size(-1)
-        x_loss = torch.sum(x_error**2 * loss_mask[..., None], dim=(-1, -2)) / loss_denom
-        loss_dict = {"loss": x_loss.mean(), "x_loss": x_loss}
+        loss_denom = torch.sum(loss_mask, dim=-1) * velocity.size(-1)
+        x_loss = torch.sum(velocity_error**2 * loss_mask[..., None], dim=(-1, -2)) / loss_denom
+        # logits loss
+        logits_loss = F.cross_entropy(logits, dataset_idx)
+        loss = x_loss.mean() + logits_loss
+        loss_dict = {"loss": loss, "x_loss": x_loss, "logits_loss": logits_loss}
 
         # add diffusion loss stratified across t
         num_bins = 4
@@ -409,10 +405,10 @@ class LatentDiffusionLitModule(LightningModule):
                 # )
 
         # forward pass
-        pred_x, noisy_dense_encoded_batch = self.forward(batch)
+        velocity, logits, noisy_dense_encoded_batch = self.forward(batch)
 
         # calculate loss
-        loss_dict = self.criterion(noisy_dense_encoded_batch, pred_x)
+        loss_dict = self.criterion(noisy_dense_encoded_batch, velocity, logits, batch.dataset_idx)
 
         # log relative proportions of datasets in batch
         loss_dict["dataset_idx"] = batch.dataset_idx.detach().flatten()
@@ -485,10 +481,10 @@ class LatentDiffusionLitModule(LightningModule):
         generation_evaluator.device = metrics["loss"].device
 
         # forward pass
-        pred_x, noisy_dense_encoded_batch = self.forward(batch)
+        velocity, logits, noisy_dense_encoded_batch = self.forward(batch)
 
         # calculate loss
-        loss_dict = self.criterion(noisy_dense_encoded_batch, pred_x)
+        loss_dict = self.criterion(noisy_dense_encoded_batch, velocity, logits)
 
         # update and log per-step val metrics
         for k, v in loss_dict.items():

@@ -35,8 +35,6 @@ class FlowMatchingInterpolant:
         self.min_t = min_t
         self.corrupt = corrupt
         self.num_timesteps = num_timesteps
-        self.self_condition = self_condition
-        self.self_condition_prob = self_condition_prob
         self.device = device
 
     def _sample_t(self, batch_size):
@@ -109,13 +107,13 @@ class FlowMatchingInterpolant:
         token_mask=None,
         token_idx=None,
     ):
-        """Generates new samples of a specified (B, N, d) using denoiser model.
+        """Generates new samples of a specified (B, N, d) using energy-based velocity prediction model.
 
         Args:
             batch_size (int): Number of samples to generate.
             num_tokens (int): Number of tokens in each sample.
             emb_dim (int): Dimension of each token.
-            model (nn.Module): Denoiser model to use.
+            model (nn.Module): Energy-based velocity prediction model to use.
             dataset_idx (torch.Tensor): Dataset index, used for classifier-free guidance. (B, 1)
             spacegroup (torch.Tensor): Spacegroup, used for classifier-free guidance. (B, 1)
             num_timesteps (int): Number of timesteps to integrate over.
@@ -147,9 +145,8 @@ class FlowMatchingInterpolant:
 
         tokens_traj = [x_0]
         clean_traj = []
-        x_sc = None
         for t_2 in ts[1:]:
-            # Run denoiser model
+            # Run velocity prediction model
             x_t_1 = tokens_traj[-1]
             if self.corrupt:
                 x = x_t_1
@@ -160,19 +157,19 @@ class FlowMatchingInterpolant:
             t = torch.ones((batch_size, 1), device=self.device) * t_1
             d_t = t_2 - t_1
 
-            # Run denoiser model
+            # Run velocity prediction model
             with torch.no_grad():
-                pred_x_1 = model(
-                    x, t, dataset_idx, spacegroup, token_mask, x_sc
+                pred_v = model.get_velocity(
+                    x, t, dataset_idx, spacegroup, token_mask
                 )
 
-            # Process model output
+            # Process model output - convert velocity to x_1 prediction
+            # v = (x_1 - x_t) / (1 - t) => x_1 = x_t + v * (1 - t)
+            pred_x_1 = x + pred_v * (1 - t_1)
             clean_traj.append(pred_x_1)
-            if self.self_condition:
-                x_sc = pred_x_1
 
-            # Take reverse step
-            x_t_2 = self._x_euler_step(d_t, t_1, pred_x_1, x_t_1)
+            # Take reverse step using velocity
+            x_t_2 = x_t_1 + pred_v * d_t
 
             tokens_traj.append(x_t_2)
             t_1 = t_2
@@ -188,9 +185,10 @@ class FlowMatchingInterpolant:
             x = x_1
         t = torch.ones((batch_size, 1), device=self.device) * t_1
         with torch.no_grad():
-            pred_x_1 = model(
-                x, t, dataset_idx, spacegroup, token_mask, x_sc
+            pred_v = model.get_velocity(
+                x, t, dataset_idx, spacegroup, token_mask
             )
+        pred_x_1 = x + pred_v * (1 - t_1)
         clean_traj.append(pred_x_1)
         tokens_traj.append(pred_x_1)
 
@@ -211,7 +209,7 @@ class FlowMatchingInterpolant:
         token_mask=None,
         token_idx=None,
     ):
-        """Generates new samples of a specified (B, N, d) using denoiser model with classifier-free
+        """Generates new samples of a specified (B, N, d) using energy-based velocity prediction model with classifier-free
         guidance.
 
         To be used with DiT denoisers, which use a different forward pass signature.
@@ -220,7 +218,7 @@ class FlowMatchingInterpolant:
             batch_size (int): Number of samples to generate: B.
             num_tokens (int): Max number of tokens in each sample: N.
             emb_dim (int): Dimension of each token: d.
-            model (nn.Module): Denoiser model to use.
+            model (nn.Module): Energy-based velocity prediction model to use.
             dataset_idx (torch.Tensor): Dataset index, used for classifier-free guidance. (B, 1)
             spacegroup (torch.Tensor): Spacegroup, used for classifier-free guidance. (B, 1)
             cfg_scale (float): Scale factor for classifier-free guidance.
@@ -247,13 +245,6 @@ class FlowMatchingInterpolant:
                 None
             ].repeat(batch_size, 1)
 
-        # Set-up classifier-free guidance
-        x_0 = torch.cat([x_0, x_0], dim=0)  # (2B, N, d)
-        dataset_idx_null = torch.zeros_like(dataset_idx)
-        dataset_idx = torch.cat([dataset_idx, dataset_idx_null], dim=0)  # (2B, 1)
-        spacegroup_null = torch.zeros_like(spacegroup)
-        spacegroup = torch.cat([spacegroup, spacegroup_null], dim=0)  # (2B, 1)
-        token_mask = torch.cat([token_mask, token_mask], dim=0)  # (2B, N)
 
         # Set-up time
         if num_timesteps is None:
@@ -263,32 +254,31 @@ class FlowMatchingInterpolant:
 
         tokens_traj = [x_0]
         clean_traj = []
-        x_sc = None
         for t_2 in ts[1:]:
-            # Set-up input to denoiser
+            # Set-up input to velocity prediction model
             x_t_1 = tokens_traj[-1]
             if self.corrupt:
                 x = x_t_1
             else:
                 if x_1 is None:
                     raise ValueError("Must provide x_1 if not corrupting.")
-                x = torch.cat([x_1, x_1], dim=0)  # (2B, N, d)
-            t = torch.ones((2 * batch_size, 1), device=self.device) * t_1
+                x = x_1
+            t = torch.ones((batch_size, 1), device=self.device) * t_1
             d_t = t_2 - t_1
 
-            # Run denoiser model
+            # Run velocity prediction model with CFG
             with torch.no_grad():
-                pred_x_1 = model.forward_with_cfg(
-                    x, t, dataset_idx, spacegroup, token_mask, cfg_scale, x_sc
+                velocity = model.forward_with_cfg(
+                    x, t, dataset_idx, spacegroup, token_mask, cfg_scale
                 )
 
-            # Process model output
-            clean_traj.append(pred_x_1.chunk(2, dim=0)[0])  # Remove null class samples
-            if self.self_condition:
-                x_sc = pred_x_1
+            # Process model output - convert velocity to x_1 prediction
+            # v = (x_1 - x_t) / (1 - t) => x_1 = x_t + v * (1 - t)
+            pred_x_1 = x + velocity * (1 - t_1)
+            clean_traj.append(pred_x_1)
 
-            # Take reverse step
-            x_t_2 = self._x_euler_step(d_t, t_1, pred_x_1, x_t_1)
+            # Take reverse step using velocity
+            x_t_2 = x_t_1 + velocity * d_t
 
             tokens_traj.append(x_t_2)
             t_1 = t_2
@@ -302,15 +292,16 @@ class FlowMatchingInterpolant:
             if x_1 is None:
                 raise ValueError("Must provide x_1 if not corrupting.")
             x = x_1
-        t = torch.ones((2 * batch_size, 1), device=self.device) * t_1
+        t = torch.ones((batch_size, 1), device=self.device) * t_1
         with torch.no_grad():
-            pred_x_1 = model.forward_with_cfg(
-                x, t, dataset_idx, spacegroup, token_mask, cfg_scale, x_sc
+            velocity = model.forward_with_cfg(
+                x, t, dataset_idx, spacegroup, token_mask, cfg_scale
             )
-        clean_traj.append(pred_x_1.chunk(2, dim=0)[0])  # Remove null class samples
+        pred_x_1 = x + velocity * (1 - t_1)
+        clean_traj.append(pred_x_1)
         tokens_traj.append(pred_x_1)
 
         return {"tokens_traj": tokens_traj, "clean_traj": clean_traj}
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(num_timesteps={self.num_timesteps}, self_condition={self.self_condition})"
+        return f"{self.__class__.__name__}(num_timesteps={self.num_timesteps})"
