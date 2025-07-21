@@ -89,6 +89,13 @@ class MoleculeGenerationEvaluator:
                 m_frags = Chem.rdmolops.GetMolFrags(m, asMols=True)
                 largest_frag = max(m_frags, default=m, key=lambda frag: frag.GetNumAtoms())
                 pred_smiles = Chem.MolToSmiles(largest_frag, isomericSmiles=True)
+                # ✅ NEW: test PoseBusters on this single molecule
+                try:
+                    self.buster.bust([m], None, None)  # single molecule check
+                except Exception as e:
+                    print(f"PoseBusters failed on molecule index {idx}: {e}")
+                    raise  # skip adding to valid_molecules by going to outer except
+
                 valid = True
                 valid_molecules.append(m)
                 valid_smiles.append(pred_smiles)
