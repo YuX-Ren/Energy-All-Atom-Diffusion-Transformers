@@ -178,14 +178,27 @@ class MultiheadAttention(nn.Module):
         q = self.q(query)
         k = self.k(key)
         v = self.v(value)
-        q = q.view(q.size(0), q.size(1), self.num_heads, -1).transpose(1, 2)
-        k = k.view(k.size(0), k.size(1), self.num_heads, -1).transpose(1, 2)
-        v = v.view(v.size(0), v.size(1), self.num_heads, -1).transpose(1, 2)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+        
+        # Optimized attention computation with better memory layout
+        batch_size, seq_len, hidden_dim = q.shape
+        head_dim = hidden_dim // self.num_heads
+        
+        q = q.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        
+        # Use scaled dot-product attention with optional key padding mask
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        
+        if key_padding_mask is not None:
+            attn_weights = attn_weights.masked_fill(key_padding_mask, float('-inf'))
+            
         attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = F.dropout(attn_weights, p=self.dropout)
+        attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(query.size(0), -1, query.size(-1))
+        
+        # Reshape back to original format
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_dim)
         attn_output = self.out(attn_output)
         return attn_output
 
@@ -397,10 +410,12 @@ class DiT(nn.Module):
         
             # Get energy scores
             energy_scores = self.forward(x, t, dataset_idx, spacegroup, mask)
+            # energy equals log-sum-exp of energy_scores
+            energy = torch.logsumexp(energy_scores, dim=1)
             
             # Compute velocity as negative gradient of energy
             velocity = -torch.autograd.grad(
-                energy_scores.sum(dim=1), x, grad_outputs=torch.ones(energy_scores.shape[0], device=energy_scores.device), create_graph=True, retain_graph=True,
+                energy, x, grad_outputs=torch.ones(energy.shape[0], device=energy.device), create_graph=True, retain_graph=True,
             )[0]
         return velocity, energy_scores
 

@@ -388,7 +388,7 @@ class LatentDiffusionLitModule(LightningModule):
                         "bi,bij->bj", batch.pos[node_is_periodic], cell_per_node_inv
                     )
                     frac_coords_aug = frac_coords_aug % 1.0
-                    batch.frac_coords[node_is_periodic] = frac_coords_aug
+                    batch.frac_coords[node_is_periodic] = frac_coords_aug.to(batch.frac_coords.dtype)
 
             if self.hparams.augmentations.pos == True:
                 rot_mat = random_rotation_matrix(validate=True, device=self.device)

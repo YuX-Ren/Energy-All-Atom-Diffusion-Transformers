@@ -663,11 +663,24 @@ class VariationalAutoencoderLitModule(LightningModule):
         :param stage: Either `"fit"`, `"validate"`, `"test"`, or `"predict"`.
         """
         if self.hparams.compile and stage == "fit":
-            # self.net = torch.compile(self.net)
-            self.encode = torch.compile(self.encode)
-            self.decode = torch.compile(self.decode)
-            self.quant_conv = torch.compile(self.quant_conv)
-            self.post_quant_conv = torch.compile(self.post_quant_conv)
+            print("🚀 Applying torch.compile() to VAE components...")
+            
+            # Apply compilation to encoder and decoder if they support it
+            if hasattr(self.encoder, 'apply_torch_compile'):
+                self.encoder.compile = True
+                self.encoder.apply_torch_compile()
+            
+            if hasattr(self.decoder, 'apply_torch_compile'):
+                self.decoder.compile = True
+                self.decoder.apply_torch_compile()
+            
+            # Compile the quantization layers
+            self.encode = torch.compile(self.encode, mode="default")
+            self.decode = torch.compile(self.decode, mode="default")
+            self.quant_conv = torch.compile(self.quant_conv, mode="default")
+            self.post_quant_conv = torch.compile(self.post_quant_conv, mode="default")
+            
+            print("✅ VAE compilation completed")
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Choose what optimizers and learning-rate schedulers to use in your optimization.
