@@ -25,6 +25,8 @@ from src.models.components.kabsch_utils import (
 )
 from src.utils import pylogger
 
+from vector_quantize_pytorch import FSQ
+
 log = pylogger.RankedLogger(__name__)
 
 
@@ -142,9 +144,14 @@ class VariationalAutoencoderLitModule(LightningModule):
         self.encoder = encoder
         self.decoder = decoder
 
+        # add FSQ layers
+        levels = [8, 5, 5, 5] # target size 2^10, actual size 1000
+        self.quant_conv_FSQ = torch.nn.Linear(self.encoder.d_model, len(levels), bias=False)
+        self.post_quant_conv_FSQ = torch.nn.Linear(len(levels), self.decoder.d_model, bias=False)
+        self.quantizer = FSQ(levels)
         # quantization layers (following naming convention from Latent Diffusion)
-        self.quant_conv = torch.nn.Linear(self.encoder.d_model, 2 * latent_dim, bias=False)
-        self.post_quant_conv = torch.nn.Linear(latent_dim, self.decoder.d_model, bias=False)
+        # self.quant_conv = torch.nn.Linear(self.encoder.d_model, 2 * latent_dim, bias=False)
+        # self.post_quant_conv = torch.nn.Linear(latent_dim, self.decoder.d_model, bias=False)
         # NOTE these layers actually output the mean and logvar of the posterior distribution
 
         # weights for scaling loss functions per dataset type
@@ -270,21 +277,23 @@ class VariationalAutoencoderLitModule(LightningModule):
 
     def encode(self, batch):
         encoded_batch = self.encoder(batch)
-        encoded_batch["moments"] = self.quant_conv(encoded_batch["x"])
-        encoded_batch["posterior"] = DiagonalGaussianDistribution(encoded_batch["moments"])
+        encoded_batch["moments"] = self.quant_conv_FSQ(encoded_batch["x"])
+        # encoded_batch["posterior"] = DiagonalGaussianDistribution(encoded_batch["moments"])
         return encoded_batch
 
     def decode(self, encoded_batch):
-        encoded_batch["x"] = self.post_quant_conv(encoded_batch["x"])
+        encoded_batch["x"] = self.post_quant_conv_FSQ(encoded_batch["x"])
         out = self.decoder(encoded_batch)
         return out
 
     def forward(self, batch: Data, sample_posterior: bool = True):
         encoded_batch = self.encode(batch)
-        if sample_posterior:
-            encoded_batch["x"] = encoded_batch["posterior"].sample()
-        else:
-            encoded_batch["x"] = encoded_batch["posterior"].mode()
+        # if sample_posterior:
+        #     encoded_batch["x"] = encoded_batch["posterior"].sample()
+        # else:
+        #     encoded_batch["x"] = encoded_batch["posterior"].mode()
+        code, indices = self.quantizer(encoded_batch["moments"].unsqueeze(0))
+        encoded_batch["x"] = code.squeeze(0)
         out = self.decode(encoded_batch)
         return out, encoded_batch
 
@@ -297,17 +306,17 @@ class VariationalAutoencoderLitModule(LightningModule):
         loss_atom_types = F.cross_entropy(out["atom_types"], batch.atom_types, reduction="none")
 
         # Lattice lengths loss, after scaling by num_atoms**(1/3)
-        loss_lengths = F.mse_loss(out["lengths"], batch.lengths_scaled, reduction="none").mean(
-            dim=1
-        )
+        # loss_lengths = F.mse_loss(out["lengths"], batch.lengths_scaled, reduction="none").mean(
+        #     dim=1
+        # )
 
-        # Lattice angles loss, in radians
-        loss_angles = F.mse_loss(out["angles"], batch.angles_radians, reduction="none").mean(dim=1)
+        # # Lattice angles loss, in radians
+        # loss_angles = F.mse_loss(out["angles"], batch.angles_radians, reduction="none").mean(dim=1)
 
-        # Fractional coordinates loss
-        loss_frac_coords = F.mse_loss(
-            out["frac_coords"], batch.frac_coords, reduction="none"
-        ).mean(dim=1)
+        # # Fractional coordinates loss
+        # loss_frac_coords = F.mse_loss(
+        #     out["frac_coords"], batch.frac_coords, reduction="none"
+        # ).mean(dim=1)
 
         # Coordinates loss after zero-centering, use nm as unit (not A)
         pos_pred = out["pos"]
@@ -320,9 +329,9 @@ class VariationalAutoencoderLitModule(LightningModule):
 
         return {
             "loss_atom_types": loss_atom_types,
-            "loss_lengths": loss_lengths,
-            "loss_angles": loss_angles,
-            "loss_frac_coords": loss_frac_coords,
+            # "loss_lengths": loss_lengths,
+            # "loss_angles": loss_angles,
+            # "loss_frac_coords": loss_frac_coords,
             "loss_pos": loss_pos,
         }
 
@@ -333,39 +342,39 @@ class VariationalAutoencoderLitModule(LightningModule):
         loss_reconst = self.reconstruction_criterion(batch, out)
 
         # KL divergence loss
-        loss_kl = encoded_batch["posterior"].kl()
+        # loss_kl = encoded_batch["posterior"].kl()
 
         # Assign loss_weights tensors based on dataset_idx attribute in batch
         weights_atom_types = self.loss_weights_atom_types[batch.dataset_idx[batch.batch]]
-        weights_lengths = self.loss_weights_lengths[batch.dataset_idx]
-        weights_angles = self.loss_weights_angles[batch.dataset_idx]
-        weights_frac_coords = self.loss_weights_frac_coords[batch.dataset_idx[batch.batch]]
+        # weights_lengths = self.loss_weights_lengths[batch.dataset_idx]
+        # weights_angles = self.loss_weights_angles[batch.dataset_idx]
+        # weights_frac_coords = self.loss_weights_frac_coords[batch.dataset_idx[batch.batch]]
         weights_pos = self.loss_weights_pos[batch.dataset_idx[batch.batch]]
         weights_kl = self.loss_weights_kl[batch.dataset_idx[batch.batch]]
 
         loss = (
             (weights_atom_types * loss_reconst["loss_atom_types"]).mean()
-            + (weights_lengths * loss_reconst["loss_lengths"]).mean()
-            + (weights_angles * loss_reconst["loss_angles"]).mean()
-            + (weights_frac_coords * loss_reconst["loss_frac_coords"]).mean()
+            # + (weights_lengths * loss_reconst["loss_lengths"]).mean()
+            # + (weights_angles * loss_reconst["loss_angles"]).mean()
+            # + (weights_frac_coords * loss_reconst["loss_frac_coords"]).mean()
             + (weights_pos * loss_reconst["loss_pos"]).mean()
-            + (weights_kl * loss_kl).mean()
+            # + (weights_kl * loss_kl).mean()
         )
 
         return {
             "loss": loss,
             "loss_atom_types": weights_atom_types * loss_reconst["loss_atom_types"],
-            "loss_lengths": weights_lengths * loss_reconst["loss_lengths"],
-            "loss_angles": weights_angles * loss_reconst["loss_angles"],
-            "loss_frac_coords": weights_frac_coords * loss_reconst["loss_frac_coords"],
+            # "loss_lengths": weights_lengths * loss_reconst["loss_lengths"],
+            # "loss_angles": weights_angles * loss_reconst["loss_angles"],
+            # "loss_frac_coords": weights_frac_coords * loss_reconst["loss_frac_coords"],
             "loss_pos": weights_pos * loss_reconst["loss_pos"],
-            "loss_kl": weights_kl * loss_kl,
+            # "loss_kl": weights_kl * loss_kl,
             "unscaled/loss_atom_types": loss_reconst["loss_atom_types"],
-            "unscaled/loss_lengths": loss_reconst["loss_lengths"],
-            "unscaled/loss_angles": loss_reconst["loss_angles"],
-            "unscaled/loss_frac_coords": loss_reconst["loss_frac_coords"],
+            # "unscaled/loss_lengths": loss_reconst["loss_lengths"],
+            # "unscaled/loss_angles": loss_reconst["loss_angles"],
+            # "unscaled/loss_frac_coords": loss_reconst["loss_frac_coords"],
             "unscaled/loss_pos": loss_reconst["loss_pos"],
-            "unscaled/loss_kl": loss_kl,
+            # "unscaled/loss_kl": loss_kl,
         }
 
     #####################################################################################################
@@ -396,33 +405,33 @@ class VariationalAutoencoderLitModule(LightningModule):
             sample_is_periodic = batch.dataset_idx == DATASET_TO_IDX["mp20"]
             node_is_periodic = sample_is_periodic[batch.batch]
 
-            if self.hparams.augmentations.frac_coords == True:
-                if node_is_periodic.any():
-                    # sample random translation vector from batch length distribution / 2
-                    random_translation = (
-                        torch.normal(
-                            torch.abs(batch.lengths.mean(dim=0)),
-                            torch.abs(batch.lengths.std(dim=0)) + 1e-8,
-                        )
-                        / 2
-                    )
-                    # apply same random translation to all Cartesian coordinates
-                    pos_aug = batch.pos + random_translation
-                    batch.pos = pos_aug
-                    # compute new fractional coordinates for samples which are periodic
-                    cell_per_node_inv = torch.linalg.inv(batch.cell[batch.batch][node_is_periodic])
-                    frac_coords_aug = torch.einsum(
-                        "bi,bij->bj", batch.pos[node_is_periodic], cell_per_node_inv
-                    )
-                    frac_coords_aug = frac_coords_aug % 1.0
-                    batch.frac_coords[node_is_periodic] = frac_coords_aug
+            # if self.hparams.augmentations.frac_coords == True:
+            #     if node_is_periodic.any():
+            #         # sample random translation vector from batch length distribution / 2
+            #         random_translation = (
+            #             torch.normal(
+            #                 torch.abs(batch.lengths.mean(dim=0)),
+            #                 torch.abs(batch.lengths.std(dim=0)) + 1e-8,
+            #             )
+            #             / 2
+            #         )
+            #         # apply same random translation to all Cartesian coordinates
+            #         pos_aug = batch.pos + random_translation
+            #         batch.pos = pos_aug
+            #         # compute new fractional coordinates for samples which are periodic
+            #         cell_per_node_inv = torch.linalg.inv(batch.cell[batch.batch][node_is_periodic])
+            #         frac_coords_aug = torch.einsum(
+            #             "bi,bij->bj", batch.pos[node_is_periodic], cell_per_node_inv
+            #         )
+            #         frac_coords_aug = frac_coords_aug % 1.0
+            #         batch.frac_coords[node_is_periodic] = frac_coords_aug
 
             if self.hparams.augmentations.pos == True:
                 rot_mat = random_rotation_matrix(validate=True, device=self.device)
                 pos_aug = batch.pos @ rot_mat.T
                 batch.pos = pos_aug
-                cell_aug = batch.cell @ rot_mat.T
-                batch.cell = cell_aug
+                # cell_aug = batch.cell @ rot_mat.T
+                # batch.cell = cell_aug
                 # fractional coordinates are rotation invariant
                 # assert torch.allclose(
                 #     batch.frac_coords,
@@ -432,7 +441,7 @@ class VariationalAutoencoderLitModule(LightningModule):
                 # )
 
             if self.hparams.augmentations.noise > 0.0:
-                total_atoms = batch.num_atoms.sum().item()
+                total_atoms = batch.num_nodes
                 # select X% of atom types to be perturbed
                 perturbed_idx = torch.tensor(
                     np.random.choice(
@@ -458,7 +467,7 @@ class VariationalAutoencoderLitModule(LightningModule):
                 )
                 # save original positions and fractional coordinates
                 pos_ = batch.pos.clone()
-                frac_coords_ = batch.frac_coords.clone()
+                # frac_coords_ = batch.frac_coords.clone()
                 # add random noise to perturbed positions
                 corruption_scale = 0.1
                 noise = (
@@ -467,13 +476,13 @@ class VariationalAutoencoderLitModule(LightningModule):
                 )
                 batch.pos[perturbed_idx] += noise
                 # compute new fractional coordinates for samples which are periodic
-                if node_is_periodic.any():
-                    cell_per_node_inv = torch.linalg.inv(batch.cell[batch.batch][node_is_periodic])
-                    frac_coords_aug = torch.einsum(
-                        "bi,bij->bj", batch.pos[node_is_periodic], cell_per_node_inv
-                    )
-                    frac_coords_aug = frac_coords_aug % 1.0
-                    batch.frac_coords[node_is_periodic] = frac_coords_aug
+                # if node_is_periodic.any():
+                    # cell_per_node_inv = torch.linalg.inv(batch.cell[batch.batch][node_is_periodic])
+                    # frac_coords_aug = torch.einsum(
+                    #     "bi,bij->bj", batch.pos[node_is_periodic], cell_per_node_inv
+                    # )
+                    # frac_coords_aug = frac_coords_aug % 1.0
+                    # batch.frac_coords[node_is_periodic] = frac_coords_aug
 
         # forward pass
         out, encoded_batch = self.forward(batch)
@@ -482,7 +491,7 @@ class VariationalAutoencoderLitModule(LightningModule):
         if self.hparams.augmentations.noise > 0.0:
             batch.atom_types = atom_types_
             batch.pos = pos_
-            batch.frac_coords = frac_coords_
+            # batch.frac_coords = frac_coords_
 
         # calculate loss
         loss_dict = self.criterion(batch, encoded_batch, out)
@@ -584,16 +593,16 @@ class VariationalAutoencoderLitModule(LightningModule):
             )  # take argmax
             _atom_types[_atom_types == 0] = 1  # atom type 0 -> 1 (H) to prevent crash
             _pos = out["pos"].narrow(0, start_idx, num_atom) * 10.0  # nm to A
-            _frac_coords = out["frac_coords"].narrow(0, start_idx, num_atom)
-            _lengths = out["lengths"][idx_in_batch] * float(num_atom) ** (1 / 3)  # unscale lengths
-            _angles = torch.rad2deg(out["angles"][idx_in_batch])  # convert to degrees
+            # _frac_coords = out["frac_coords"].narrow(0, start_idx, num_atom)
+            # _lengths = out["lengths"][idx_in_batch] * float(num_atom) ** (1 / 3)  # unscale lengths
+            # _angles = torch.rad2deg(out["angles"][idx_in_batch])  # convert to degrees
             reconstruction_evaluator.append_pred_array(
                 {
                     "atom_types": _atom_types.detach().cpu().numpy(),
                     "pos": _pos.detach().cpu().numpy(),
-                    "frac_coords": _frac_coords.detach().cpu().numpy(),
-                    "lengths": _lengths.detach().cpu().numpy(),
-                    "angles": _angles.detach().cpu().numpy(),
+                    # "frac_coords": _frac_coords.detach().cpu().numpy(),
+                    # "lengths": _lengths.detach().cpu().numpy(),
+                    # "angles": _angles.detach().cpu().numpy(),
                     "sample_idx": (batch_idx + self.global_rank) * batch.batch_size + idx_in_batch,
                 }
             )
@@ -605,9 +614,9 @@ class VariationalAutoencoderLitModule(LightningModule):
                 {
                     "atom_types": _data["atom_types"].detach().cpu().numpy(),
                     "pos": _data["pos"].detach().cpu().numpy(),
-                    "frac_coords": _data["frac_coords"].detach().cpu().numpy(),
-                    "lengths": _data["lengths"].detach().cpu().numpy(),
-                    "angles": _data["angles"].detach().cpu().numpy(),
+                    # "frac_coords": _data["frac_coords"].detach().cpu().numpy(),
+                    # "lengths": _data["lengths"].detach().cpu().numpy(),
+                    # "angles": _data["angles"].detach().cpu().numpy(),
                     "sample_idx": (batch_idx + self.global_rank) * batch.batch_size + idx_in_batch,
                 }
             )

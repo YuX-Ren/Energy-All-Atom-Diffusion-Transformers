@@ -9,7 +9,8 @@ from lightning import LightningDataModule
 from omegaconf import DictConfig
 from torch.utils.data import ConcatDataset
 from torch_geometric.data import Data
-from torch_geometric.datasets import QM9
+# from torch_geometric.datasets import QM9
+from src.data.components.qm9_dataset import QM9
 from torch_geometric.loader import DataLoader
 
 from src.data.components.mp20_dataset import MP20
@@ -28,22 +29,22 @@ def custom_transform(data, removeHs=True):
 
     # PyG object attributes consistent with CrystalDataset
     return Data(
-        id=f"qm9_{data.name}",
-        atom_types=data.z[atoms_to_keep],
-        pos=data.pos[atoms_to_keep],
-        frac_coords=torch.zeros_like(data.pos[atoms_to_keep]),
-        cell=torch.zeros((1, 3, 3)),
-        lattices=torch.zeros(1, 6),
-        lattices_scaled=torch.zeros(1, 6),
-        lengths=torch.zeros(1, 3),
-        lengths_scaled=torch.zeros(1, 3),
-        angles=torch.zeros(1, 3),
-        angles_radians=torch.zeros(1, 3),
-        num_atoms=torch.LongTensor([num_atoms]),
-        num_nodes=torch.LongTensor([num_atoms]),  # special attribute used for PyG batching
-        spacegroup=torch.zeros(1, dtype=torch.long),  # null spacegroup
-        token_idx=torch.arange(num_atoms),
-        dataset_idx=torch.tensor([1], dtype=torch.long),  # 1 --> indicates non-periodic/molecule
+        # id=f"qm9_{data.name}",
+        # atom_types=data.z[atoms_to_keep],
+        # pos=data.pos[atoms_to_keep],
+        # frac_coords=torch.zeros_like(data.pos[atoms_to_keep]),
+        # cell=torch.zeros((1, 3, 3)),
+        # lattices=torch.zeros(1, 6),
+        # lattices_scaled=torch.zeros(1, 6),
+        # lengths=torch.zeros(1, 3),
+        # lengths_scaled=torch.zeros(1, 3),
+        # angles=torch.zeros(1, 3),
+        # angles_radians=torch.zeros(1, 3),
+        # num_nodes=torch.LongTensor([num_atoms]),  # special attribute used for PyG batching
+        # spacegroup=torch.zeros(1, dtype=torch.long),  # null spacegroup
+        # token_idx=torch.arange(num_atoms),
+        # dataset_idx=torch.tensor([1], dtype=torch.long),  # 1 --> indicates non-periodic/molecule
+        # num_atoms=torch.LongTensor([num_atoms]),
     )
 
 
@@ -112,9 +113,17 @@ class JointDataModule(LightningDataModule):
         :param stage: The stage to setup. Either `"fit"`, `"validate"`, `"test"`, or `"predict"`. Defaults to ``None``.
         """
         # QM9 dataset
+        # Option 1: Use transform (applied during training - slower)
+        # qm9_dataset = QM9(
+        #     root=self.hparams.datasets.qm9.root,
+        #     transform=OptimizedQM9Transform(removeHs=self.hparams.datasets.qm9.removeHs),
+        # ).shuffle()
+        
+        # Option 2: Use pre_transform for maximum performance (applied once during preprocessing)
+        # Uncomment the following and comment the above for best performance:
         qm9_dataset = QM9(
             root=self.hparams.datasets.qm9.root,
-            transform=partial(custom_transform, removeHs=self.hparams.datasets.qm9.removeHs),
+            # transform=partial(custom_transform, removeHs=self.hparams.datasets.qm9.removeHs),
         ).shuffle()
         # # save num_nodes histogram for sampling from generative models
         # num_nodes = torch.tensor([data["num_nodes"] for data in qm9_dataset])
@@ -208,9 +217,11 @@ class JointDataModule(LightningDataModule):
             dataset=self.train_dataset,
             batch_size=self.hparams.batch_size.train,
             num_workers=self.hparams.num_workers.train,
-            pin_memory=False,
+            pin_memory=True,
             shuffle=True,
             drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=2,  # optimal value: 2 batches per worker for better performance
         )
 
     def val_dataloader(self) -> Sequence[DataLoader]:
@@ -225,6 +236,7 @@ class JointDataModule(LightningDataModule):
                 num_workers=self.hparams.num_workers.val,
                 pin_memory=False,
                 shuffle=False,
+                persistent_workers=True,
             ),
             DataLoader(
                 dataset=self.qm9_val_dataset,
@@ -232,13 +244,15 @@ class JointDataModule(LightningDataModule):
                 num_workers=self.hparams.num_workers.val,
                 pin_memory=False,
                 shuffle=False,
+                persistent_workers=True,
             ),
             DataLoader(
                 dataset=self.qmof150_val_dataset,
                 batch_size=self.hparams.batch_size.val,
                 num_workers=self.hparams.num_workers.val,
-                pin_memory=False,
+                pin_memory=True,
                 shuffle=False,
+                persistent_workers=True,
             ),
         ]
 
@@ -254,6 +268,8 @@ class JointDataModule(LightningDataModule):
                 num_workers=self.hparams.num_workers.test,
                 pin_memory=False,
                 shuffle=False,
+                persistent_workers=True,
+                prefetch_factor=2,
             ),
             DataLoader(
                 dataset=self.qm9_test_dataset,
@@ -261,6 +277,8 @@ class JointDataModule(LightningDataModule):
                 num_workers=self.hparams.num_workers.test,
                 pin_memory=False,
                 shuffle=False,
+                persistent_workers=True,
+                prefetch_factor=2,
             ),
             DataLoader(
                 dataset=self.qmof150_test_dataset,
@@ -268,5 +286,7 @@ class JointDataModule(LightningDataModule):
                 num_workers=self.hparams.num_workers.test,
                 pin_memory=False,
                 shuffle=False,
+                persistent_workers=True,
+                prefetch_factor=2,
             ),
         ]

@@ -76,8 +76,8 @@ class TransformerDecoder(nn.Module):
 
         self.atom_types_head = nn.Linear(d_model, max_num_elements, bias=True)
         self.pos_head = nn.Linear(d_model, 3, bias=False)
-        self.frac_coords_head = nn.Linear(d_model, 3, bias=False)
-        self.lattice_head = nn.Linear(d_model, 6, bias=False)
+        # self.frac_coords_head = nn.Linear(d_model, 3, bias=False)
+        # self.lattice_head = nn.Linear(d_model, 6, bias=False)
 
     def forward(self, encoded_batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -107,19 +107,19 @@ class TransformerDecoder(nn.Module):
         atom_types_out = self.atom_types_head(x)
 
         # Lattice lengths and angles prediction head
-        lattices_out = self.lattice_head(x_global)
+        # lattices_out = self.lattice_head(x_global)
 
         # Fractional coordinates prediction head
-        frac_coords_out = self.frac_coords_head(x)
+        # frac_coords_out = self.frac_coords_head(x)
 
         # Cartesian coordinates prediction head
         pos_out = self.pos_head(x)
 
         return {
             "atom_types": atom_types_out,
-            "lattices": lattices_out,
-            "lengths": lattices_out[:, :3],
-            "angles": lattices_out[:, 3:],
-            "frac_coords": frac_coords_out,
+            # "lattices": lattices_out,
+            # "lengths": lattices_out[:, :3],
+            # "angles": lattices_out[:, 3:],
+            # "frac_coords": frac_coords_out,
             "pos": pos_out,
         }

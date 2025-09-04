@@ -31,106 +31,6 @@ def get_index_embedding(indices, emb_dim, max_len=2048):
     return pos_embedding
 
 
-# class TransformerEncoder(nn.Module):
-#     """Transformer encoder as part of standard Transformer-based VAEs.
-
-#     Args:
-#         max_num_elements: Maximum number of elements in the dataset
-#         d_model: Dimension of the model
-#         nhead: Number of attention heads
-#         dim_feedforward: Dimension of the feedforward network
-#         activation: Activation function to use
-#         dropout: Dropout rate
-#         norm_first: Whether to use pre-normalization in Transformer blocks
-#         bias: Whether to use bias
-#         num_layers: Number of layers
-#     """
-
-#     def __init__(
-#         self,
-#         max_num_elements=100,
-#         d_model: int = 1024,
-#         nhead: int = 8,
-#         dim_feedforward: int = 2048,
-#         activation: str = "gelu",
-#         dropout: float = 0.0,
-#         norm_first: bool = True,
-#         bias: bool = True,
-#         num_layers: int = 6,
-#     ):
-#         super().__init__()
-
-#         self.max_num_elements = max_num_elements
-#         self.d_model = d_model
-#         self.num_layers = num_layers
-
-#         self.atom_type_embedder = nn.Embedding(max_num_elements, d_model)
-#         self.pos_embedder = nn.Sequential(
-#             nn.Linear(3, d_model, bias=False),
-#             nn.SiLU(),
-#             nn.Linear(d_model, d_model),
-#         )
-#         # self.frac_coords_embedder = nn.Sequential(
-#         #     nn.Linear(3, d_model, bias=False),
-#         #     nn.SiLU(),
-#         #     nn.Linear(d_model, d_model),
-#         # )
-
-#         activation = {
-#             "gelu": nn.GELU(approximate="tanh"),
-#             "relu": nn.ReLU(),
-#         }[activation]
-#         self.transformer = nn.TransformerEncoder(
-#             nn.TransformerEncoderLayer(
-#                 d_model=d_model,
-#                 nhead=nhead,
-#                 dim_feedforward=dim_feedforward,
-#                 activation=activation,
-#                 dropout=dropout,
-#                 batch_first=True,
-#                 norm_first=norm_first,
-#                 bias=bias,
-#             ),
-#             norm=nn.LayerNorm(d_model),
-#             num_layers=num_layers,
-#         )
-
-#     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-#         """
-#         Args:
-#             batch: Data object with the following attributes:
-#                 atom_types (torch.Tensor): Atomic numbers of atoms in the batch
-#                 pos (torch.Tensor): Cartesian coordinates of atoms in the batch
-#                 frac_coords (torch.Tensor): Fractional coordinates of atoms in the batch
-#                 cell (torch.Tensor): Lattice vectors of the unit cell
-#                 lattices (torch.Tensor): Lattice parameters of the unit cell (lengths and angles)
-#                 lengths (torch.Tensor): Lengths of the lattice vectors
-#                 angles (torch.Tensor): Angles between the lattice vectors
-#                 num_atoms (torch.Tensor): Number of atoms in the batch
-#                 batch (torch.Tensor): Batch index for each atom
-#         """
-#         x = self.atom_type_embedder(batch.atom_types)  # (n, d)
-#         x += self.pos_embedder(batch.pos)
-#         # x += self.frac_coords_embedder(batch.frac_coords)
-
-#         # Positional embedding
-#         x += get_index_embedding(batch.token_idx, self.d_model)
-
-#         # Convert from PyG batch to dense batch with padding
-#         x, token_mask = to_dense_batch(x, batch.batch)
-
-#         # Transformer forward pass
-#         x = self.transformer.forward(x, src_key_padding_mask=(~token_mask))
-#         x = x[token_mask]
-
-#         return {
-#             "x": x,
-#             "num_atoms": batch.num_nodes,
-#             "batch": batch.batch,
-#             "token_idx": batch.token_idx,
-#         }
-
-
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
@@ -265,7 +165,7 @@ class Mlp(nn.Module):
 
 def modulate(x, shift, scale):
     # TODO this is global modulation; explore per-token modulation
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    return x * (1 + scale) + shift
 
 
 class DiTBlock(nn.Module):
@@ -290,33 +190,15 @@ class DiTBlock(nn.Module):
     def forward(self, x, c, mask):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
             c
-        ).chunk(6, dim=1)
+        ).chunk(6, dim=2)
         _x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = (
             x
-            + gate_msa.unsqueeze(1)
+            + gate_msa
             * self.attn(_x, _x, _x, key_padding_mask=mask, need_weights=False)[0]
         )
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
-
-
-# class FinalLayer(nn.Module):
-#     """The final layer of DiT."""
-
-#     def __init__(self, hidden_dim, out_dim):
-#         super().__init__()
-#         self.norm_final = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-#         self.linear = nn.Linear(hidden_dim, out_dim, bias=True)
-#         self.adaLN_modulation = nn.Sequential(
-#             nn.SiLU(), nn.Linear(hidden_dim, 2 * hidden_dim, bias=True)
-#         )
-
-#     def forward(self, x, c):
-#         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-#         x = modulate(self.norm_final(x), shift, scale)
-#         x = self.linear(x)
-#         return x
 
 
 class TransformerEncoder(nn.Module):
@@ -344,6 +226,7 @@ class TransformerEncoder(nn.Module):
         norm_first: bool = True,
         bias: bool = True,
         num_layers: int = 6,
+        use_gnn_embedding: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
@@ -357,15 +240,16 @@ class TransformerEncoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        # self.x_embedder = nn.Linear(2 * d_x, d_model, bias=True)
         self.t_embedder = TimestepEmbedder(d_model)
-        # self.dataset_embedder = LabelEmbedder(num_datasets, d_model, class_dropout_prob)
-        # self.spacegroup_embedder = LabelEmbedder(num_spacegroups, d_model, class_dropout_prob)
 
         self.blocks = nn.ModuleList(
             [DiTBlock(d_model, nhead, mlp_ratio=dim_feedforward/d_model) for _ in range(num_layers)]
         )
         self.initialize_weights()
+        self.use_gnn_embedding = use_gnn_embedding
+        if use_gnn_embedding:
+            from src.models.encoders.mesh_graph_encoder import MeshGraphNetEncoder
+            self.gnn_encoder = MeshGraphNetEncoder(d_model, d_model)
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -377,10 +261,6 @@ class TransformerEncoder(nn.Module):
 
         self.apply(_basic_init)
 
-        # Initialize label embedding table:
-        # nn.init.normal_(self.dataset_embedder.embedding_table.weight, std=0.02)
-        # nn.init.normal_(self.spacegroup_embedder.embedding_table.weight, std=0.02)
-
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
@@ -389,12 +269,6 @@ class TransformerEncoder(nn.Module):
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers:
-        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        # nn.init.constant_(self.final_layer.linear.weight, 0)
-        # nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Forward pass of DiT.
@@ -415,27 +289,24 @@ class TransformerEncoder(nn.Module):
         x += self.pos_embedder(batch.pos)
 
         x, token_mask = to_dense_batch(x, batch.batch)
-        t = torch.zeros(x.shape[0], device=x.device)
-        t = self.t_embedder(t)  # (B, d)
-        c = t  # (B, 1, d)
-
+        if self.use_gnn_embedding:
+            gnn_conditioning, _ = self.gnn_encoder(batch)
+        # t = torch.zeros(x.shape[0], device=x.device)
+        # t = self.t_embedder(t)  # (B, d)
+        # c = t  # (B, 1, d)
+        c = gnn_conditioning  # (B, 1, d)
+        c, _ = to_dense_batch(c, batch.batch)
         # Transformer blocks
         for block in self.blocks:
             x = block(x, c, ~token_mask)  # (B, N, d)
 
-
-
-        # Transformer forward pass
-        x = self.transformer.forward(x, src_key_padding_mask=(~token_mask))
     
-        # Transformer forward pass
-        x = self.transformer.forward(x, src_key_padding_mask=(~token_mask))
         x = x[token_mask]
 
         # Return embeddings
         return {
             "x": x,
-            "num_atoms": batch.num_atoms,
+            "num_atoms": batch.num_nodes,
             "batch": batch.batch,
             "token_idx": batch.token_idx,
         }

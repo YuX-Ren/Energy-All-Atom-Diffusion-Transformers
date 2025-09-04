@@ -130,7 +130,7 @@ class MP20(InMemoryDataset):
             data.pos = torch.einsum(
                 "bi,bij->bj",
                 data.frac_coords,
-                torch.repeat_interleave(data.cell, data.num_atoms, dim=0),
+                torch.repeat_interleave(data.cell, data.num_nodes, dim=0),
             )
             # space group number
             data.spacegroup = torch.LongTensor([data_dict["spacegroup"]])

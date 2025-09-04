@@ -37,12 +37,12 @@ loss_weights:
     qm9: 0.00001
 
 augmentations:
-  noise: 0.1  # proportion of atoms to perturb
+  noise: 0.0  # proportion of atoms to perturb
   frac_coords: true
   pos: true
 
 visualization:
-  visualize: true
+  visualize: False
   save_dir: ${paths.viz_dir}/
 
 # compile model for faster training with pytorch 2.0
